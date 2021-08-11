@@ -1,264 +1,36 @@
-#!/usr/bin/env python
-"""
+#!/usr/bin/env bash
+set -e
 
-Simple script to decorate top-like output with Java thread names
-so that they can be further scrutinized in jconsole.
+get_python_binary() {
+  BASE_PATH="/usr/bin/python"
+  PYTHON_DISTROS="$(ls ${BASE_PATH}* | tr '\n' ' ')"
 
-"""
+  if [ "${PYTHON_DISTROS}" != "" ]; then
+    BASE_PATH_LEN=${#BASE_PATH}
+    VERSION_REQEX='^[0-9]+([.][0-9]+)?$'
 
-import sys
-import curses
-import os
-from select import select
-from argparse import ArgumentParser
-from time import sleep, time
-from re import search
-from subprocess import Popen, PIPE
-from itertools import groupby, repeat
+    NEWEST_VERSION=""
+    for DISTRO in ${PYTHON_DISTROS:1}; do
+        DISTRO_VERSION="${DISTRO:$BASE_PATH_LEN}"
+        if [[ "${DISTRO_VERSION}" =~ ${VERSION_REQEX} ]] && [[ "${DISTRO_VERSION}" > "${NEWEST_VERSION}" ]];
+        then
+          NEWEST_VERSION="${DISTRO_VERSION}"
+        fi
+    done
 
-class TopRunner():
+    if [ "${NEWEST_VERSION}" != "" ]; then
+        echo "${BASE_PATH}${NEWEST_VERSION}"
+    else
+        echo "${BASE_PATH}"
+    fi
+  fi
+}
 
-  def __init__(self):
-    # Map of expected text in the columns to the actual dict layout that we
-    # desire.
-    self.columns = {
-      'PID': 'tid',
-      'USER': 'euser',
-      '%CPU': '%cpu',
-      '%MEM': '%mem',
-      'COMMAND': 'comm'
-    }
+PYTHON_BIN="$(get_python_binary)"
+if [ "${PYTHON_BIN}" == "" ]; then
+  echo "Python distribution not found"
+  exit 1
+fi
 
-  """Return a decorated, CPU-sorted list of Java tids."""
-  def invoke_top(self, limit=None):
-    c_locale_env = os.environ.copy()
-    c_locale_env['LC_ALL'] = 'C'
-    top = Popen(['top', '-H', '-b', '-n', '1'], stdout=PIPE, env=c_locale_env)
-
-    expected_cols = self.columns.keys()
-    header_layout = self._skip_header(top.stdout, expected_cols)
-    output = map(lambda line: self._parse_top_line(line, header_layout),
-        top.stdout)
-
-    exitcode = top.wait()
-    if exitcode != 0:
-      raise Exception("top returned with exit code: %d" % (exitcode))
-
-    # Sort and trim.
-    output = sorted(output,
-        key=lambda row: float(row['%cpu']),
-        reverse=True)
-    output = filter(lambda row: row['comm'] == "java", output)
-    if limit != None:
-      return output[0:limit]
-    else:
-      return output
-
-  """Read the provided input until the top column header line is read.
-
-  Returns the header layout or raises an exception if the header line is not
-  encountered.
-
-  """
-  def _skip_header(self, topin, expected_headers):
-    while True:
-      line = topin.readline()
-      row = line.split(None)
-      row_expected = filter(lambda col: col in expected_headers, row)
-      if len(row_expected) == len(expected_headers):
-        return row
-    raise Exception("Could not find top header row, expected: %s" %
-        (join(' ', expected_headers)))
-
-  def _parse_top_line(self, line, header_layout):
-    untidied_row = dict(zip(header_layout, line.split(None)))
-    tidied_row = {}
-    for untidy_key, untidy_value in untidied_row.iteritems():
-      if untidy_key in self.columns.iterkeys():
-        tidied_row[self.columns[untidy_key]] = untidy_value
-    tidied_row['pid'] = self._get_pid_from_tid(tidied_row['tid'])
-    return tidied_row
-
-  def _get_pid_from_tid(self, tid):
-    status_file = '/proc/%d/status' % (int(tid))
-    f = open(status_file)
-    try:
-      for line in f:
-        row = line.split(None)
-        if row[0] == 'Tgid:':
-          return row[1]
-      raise Exception("Failed to determine pid from %s" % (status_file))
-    finally:
-      f.close()
-
-class PSAndJStackMerger():
-
-  """Return a dict of tid to thread name."""
-  def _get_thread_names(self, pid):
-    jstack = Popen(['jstack', pid], stdout=PIPE)
-
-    names = dict()
-    for line in jstack.stdout:
-      # jstack calls them nids and uses tid for a Java-specific concept
-      # (unrelated to what top calls a pid/tid)
-      match = search('^\"(.*?)\" .*nid=(0x[a-f0-9]+)', line)
-      if match:
-        thread_name = match.group(1)
-        tid = int(match.group(2), 0)
-        names[tid] = thread_name
-
-    exitcode = jstack.wait()
-    if exitcode != 0:
-      # This isn't necessarily an error because it may be a race
-      # condition between invoking ps and jstack.
-      pass
-
-    return names
-
-  """Add thread_name to a list of ps entries (and return those entries)."""
-  def _decorate_ps_with_thread_name(self, ps):
-
-    by_pid_func = lambda row: row['pid']
-    ps_by_pid = sorted(ps, key=by_pid_func)
-    for pid, tid_rows in groupby(ps_by_pid, key=by_pid_func):
-      names = self._get_thread_names(pid)
-      for tid_row in tid_rows:
-        tid = int(tid_row['tid'])
-        thread_name = None
-        if int(pid) == tid:
-          thread_name = '<main>'
-        elif tid in names:
-          thread_name = names[tid]
-        else:
-          thread_name = '???'
-        tid_row['thread_name'] = thread_name
-
-    return ps
-
-  def list_threads(self, limit=None):
-    top_output = TopRunner().invoke_top(limit)
-    return self._decorate_ps_with_thread_name(top_output)
-
-class Options:
-
-  def __init__(self, argv):
-    self._argv = argv
-
-  def parse(self):
-    parser = ArgumentParser(prog=self._argv[0],
-        description='top for Java threads')
-    parser.add_argument('-b', '--batch', action='store_true',
-        help='Run in batch mode (see top)')
-    parser.add_argument('-d', '--delay', metavar='N', type=float,
-        default=2,
-        help='Sleep <N> seconds between runs')
-    args = parser.parse_args(self._argv[1:])
-    self.batch = args.batch
-    self.delay = args.delay
-
-class JTop:
-
-  def __init__(self):
-    self.merger = PSAndJStackMerger()
-    self.done = False
-    self.dirty_screen = False
-
-  def print_ps(self, ps, suffix=None, maxwidth=None):
-
-    basefmt = '%5s %5s %-10s %-5s %-5s '
-    basefmtwidth = len(basefmt % (tuple(repeat('', 5))))
-    if maxwidth != None:
-      # TODO: Should try to handle very small terminal windows...
-      remaining = maxwidth - basefmtwidth
-      if remaining <= 0:
-        raise Exception("Very small terminals not supported")
-      thread_name_fmt = '%-' + str(remaining) + 's'
-    else:
-      thread_name_fmt = '%s'
-    fmt = basefmt + thread_name_fmt
-    if suffix != None:
-      fmt = fmt + suffix
-    print fmt % ('PID', 'TID', 'USER', '%CPU', '%MEM', 'THREAD')
-    columns = ('pid', 'tid', 'euser', '%cpu', '%mem', 'thread_name')
-    for proc in ps:
-      print fmt % (tuple(map(lambda key: proc[key], columns)))
-
-  def run_once(self):
-    self.print_ps(self.merger.list_threads())
-
-  def _mark_dirty(self):
-    self.dirty_screen = True
-
-  def _mark_clean(self):
-    self.dirty_screen = False
-
-  def _process_input(self, ch):
-    if ch in range(256):
-      cch = chr(ch)
-      if cch == 'q' or cch == 'Q':
-        self.done = True
-        self._mark_dirty()
-
-  def _sleep_and_process_input(self, screen):
-    delay = self.options.delay
-    while delay > 0:
-      start = time()
-      (read_ready, write_ready, err_ready) = select([sys.stdin], [], [], delay)
-      elapsed = time() - start
-      delay -= elapsed
-      if read_ready:
-        self._process_input(screen.getch())
-        if self.dirty_screen:
-          break
-      else:
-        break
-
-  def run_continuously(self):
-    # Disclaimer: I have no idea what I'm doing when it comes to ncurses.
-    # Absolute black magic hackery here based on my light read of procps'
-    # top implementation.
-    def runner(screen):
-      curses.use_default_colors()
-      first_run = True
-      while not self.done:
-        (maxy, maxx) = screen.getmaxyx()
-        ps = self.merger.list_threads(maxy - 2)
-        self.last_ps = ps
-        # Weird little hack seems to be needed on the first draw pass else
-        # it will not take effect.  Draw twice on first run.
-        for x in range(2 if first_run else 1):
-          self.print_ps(ps, '\r', maxx)
-          screen.refresh()
-        self._mark_clean()
-        first_run = False
-        self._sleep_and_process_input(screen)
-    curses.wrapper(runner)
-
-    # Lame hack to put the last output on screen after 'q' is hit.
-    # curses.wrapper is presumed to be clearing the screen on exit, which
-    # we definitely don't want.
-    if self.last_ps != None:
-      self.print_ps(self.last_ps)
-
-  def run(self, argv):
-    try:
-      self._run(argv)
-
-      # Work around: http://www.velocityreviews.com/forums/t749747-help-with-a-piping-error.html
-      sys.stdout.flush()
-    except KeyboardInterrupt:
-      sys.exit(130)
-    except (IOError, OSError):
-      sys.exit(141)
-
-  def _run(self, argv):
-    self.options = Options(argv)
-    self.options.parse()
-    if self.options.batch:
-      self.run_once()
-    else:
-      self.run_continuously()
-
-
-topRunner = JTop()
-topRunner.run(sys.argv)
+echo "Running jtop with ${PYTHON_BIN}..."
+"${PYTHON_BIN}" ./jtop.py $@

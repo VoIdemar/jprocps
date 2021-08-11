@@ -17,7 +17,7 @@ jtop works by simply combining ps and jstack and providing a similar UI to top.
 Sample Output
 -------------
 
-<pre>
+```
   PID   TID USER       %CPU  %MEM  THREAD
 13480 13483 jasta      104   2.3   main
 13480 13497 jasta      86.3  2.3   C2 CompilerThread1
@@ -25,4 +25,8 @@ Sample Output
  4866  4953 jasta      1.0   13.4  AWT-EventQueue-1 12.1.4#IC-129.713, eap:false
  4866 14154 jasta      0.9   13.4  ApplicationImpl pooled thread 36
  4866  5219 jasta      0.8   13.4  JobScheduler pool 5/8
-</pre>
+```
+
+This fork makes `jtop` work on recent versions of Python distributions - tested on Python 2.7.18 and 3.8.10, everything works fine.
+
+Use a helper Bash script `jtop` to run `jtop` with the latest version of Python available on your machine.
